@@ -1,9 +1,11 @@
 // Network-first service worker: always fresh when online, works offline from cache.
-const CACHE = 'tango-ear-v1';
+const CACHE = 'tango-ear-v2';
 const SHELL = [
   './', 'index.html', 'css/styles.css', 'manifest.webmanifest',
   'js/app.js', 'js/data.js', 'js/library.js', 'js/store.js', 'js/tags.js',
   'icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png',
+  'fonts/fraunces-latin.woff2', 'fonts/fraunces-latin-ext.woff2',
+  'fonts/inter-latin.woff2', 'fonts/inter-latin-ext.woff2',
 ];
 
 self.addEventListener('install', e => {
@@ -23,7 +25,7 @@ self.addEventListener('fetch', e => {
   e.respondWith(
     fetch(req)
       .then(res => {
-        if (res.ok && (new URL(req.url).origin === location.origin || req.url.includes('fonts.g'))) {
+        if (res.ok && new URL(req.url).origin === location.origin) {
           const copy = res.clone();
           caches.open(CACHE).then(c => c.put(req, copy));
         }

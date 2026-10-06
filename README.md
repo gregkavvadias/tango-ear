@@ -9,7 +9,9 @@ cd C:\Users\gregk\source\repos\tango-ear
 py -m http.server 8000
 ```
 
-Then open http://localhost:8000 in Chrome or Edge, and choose your tango music folder. The folder is remembered, so next time it's a single "Reopen" click.
+Then open http://localhost:8000 in Chrome or Edge, and choose your tango music folder. The folder and its scanned contents are remembered, so next time the library is ready straight away (or after a single "Reopen" click if the browser asks for permission again). After adding or moving music, use **Rescan** in the Library tab.
+
+Headphone and lock-screen buttons work during playback: previous replays the clip, next moves on to the next round (or to another part of the track if you haven't answered yet).
 
 ## Install on Android
 

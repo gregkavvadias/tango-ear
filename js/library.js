@@ -207,6 +207,15 @@ export async function filesFromHandle(dirHandle, onProgress) {
   return out;
 }
 
+// Look a file up again from a path produced by filesFromHandle ("Root/sub/name.mp3").
+export async function fileFromPath(dirHandle, path) {
+  const parts = path.split('/').slice(1);
+  const name = parts.pop();
+  let dir = dirHandle;
+  for (const p of parts) dir = await dir.getDirectoryHandle(p);
+  return (await dir.getFileHandle(name)).getFile();
+}
+
 export function filesFromInput(fileList) {
   return [...fileList]
     .filter(f => AUDIO_RE.test(f.name))
@@ -216,11 +225,15 @@ export function filesFromInput(fileList) {
 // Read tags for all items (with an IndexedDB cache keyed by path+size+mtime).
 export async function scan(items, onProgress) {
   let done = 0;
-  const withFiles = [];
-  for (const it of items) {
-    const file = it.file || await it.handle.getFile();
-    withFiles.push({ ...it, file, key: `${it.path}|${file.size}|${file.lastModified}` });
-  }
+  const withFiles = new Array(items.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: 8 }, async () => {
+    while (next < items.length) {
+      const i = next++, it = items[i];
+      const file = it.file || await it.handle.getFile();
+      withFiles[i] = { ...it, file, key: `${it.path}|${file.size}|${file.lastModified}` };
+    }
+  }));
   const cached = await idb.getMany('tags', withFiles.map(i => i.key));
   const fresh = [];
   const queue = withFiles.slice();

@@ -1,5 +1,5 @@
 import { ORCHESTRAS, ERAS, orchById } from './data.js';
-import { describe, filesFromHandle, filesFromInput, scan, norm } from './library.js';
+import { describe, fileFromPath, filesFromHandle, filesFromInput, scan, norm } from './library.js';
 import { idb, load, save } from './store.js';
 
 /* ================= State ================= */
@@ -48,8 +48,16 @@ let clip = null;       // { track, start, end, onEnd }
 let audioUrl = null;
 let loadedTrack = null;
 
-function loadTrack(track) {
-  if (loadedTrack === track && audio.readyState >= 1) return Promise.resolve();
+async function loadTrack(track) {
+  if (loadedTrack === track && audio.readyState >= 1) return;
+  // A library restored from the saved index has no File objects yet: fetch each on first play.
+  if (!track.file) {
+    try {
+      track.file = state.raw[track.id].file = await fileFromPath(state.savedHandle, track.path);
+    } catch {
+      throw new Error(`Can't find “${track.path}”. Use Rescan in the Library tab if files have moved.`);
+    }
+  }
   if (audioUrl) URL.revokeObjectURL(audioUrl);
   audioUrl = URL.createObjectURL(track.file);
   loadedTrack = track;
@@ -125,6 +133,26 @@ function setMediaSession(title) {
   } catch {}
 }
 
+// Headphone / lock-screen buttons. Previous replays the clip; next moves on: the next round once
+// this one is answered, the other side in Compare, otherwise another part of the same track.
+function initMediaControls() {
+  if (!('mediaSession' in navigator)) return;
+  const on = (action, fn) => { try { navigator.mediaSession.setActionHandler(action, fn); } catch {} };
+  on('play', () => {
+    if (!clip) return;
+    if (audio.currentTime >= clip.end - 0.2) replay();
+    else { audio.volume = 1; audio.play(); }
+  });
+  on('pause', stopAudio);
+  on('previoustrack', replay);
+  on('nexttrack', () => {
+    if (!clip) return;
+    if (clip.owner === 'quiz' && state.round?.done) newRound();
+    else if (clip.owner === 'cmp-a' || clip.owner === 'cmp-b') comparePlay(clip.owner === 'cmp-a' ? 'b' : 'a');
+    else actions['other-part']();
+  });
+}
+
 /* ================= Library loading ================= */
 
 function rebuild() {
@@ -141,7 +169,7 @@ function rebuild() {
   }
 }
 
-async function loadItems(items, name) {
+async function loadItems(items, name, remember = false) {
   if (!items.length) {
     state.busy = '';
     render();
@@ -155,6 +183,7 @@ async function loadItems(items, name) {
     state.libraryName = name;
     rebuild();
     state.round = null;
+    if (remember) await idb.set('kv', 'index', { name, entries: state.raw.map(e => ({ path: e.path, tags: e.tags })) });
     const recognised = state.byOrch.size;
     state.tab = recognised >= 2 ? 'quiz' : 'library';
     toast(`Loaded ${state.tracks.length} tracks · ${recognised} orchestras recognised`);
@@ -170,18 +199,36 @@ async function loadItems(items, name) {
 async function openFolderPicker() {
   try {
     const handle = await window.showDirectoryPicker({ id: 'tango-music', mode: 'read' });
+    await idb.del('kv', 'index');
     await idb.set('kv', 'dir', handle);
     state.savedHandle = handle;
-    state.busy = 'Scanning folder…'; render();
-    const items = await filesFromHandle(handle, msg => { state.busy = msg; renderBusy(); });
-    await loadItems(items, handle.name);
+    await scanSaved();
   } catch (e) {
     if (e.name !== 'AbortError') toast(e.message);
     state.busy = ''; render();
   }
 }
 
-async function reopenSaved() {
+async function scanSaved() {
+  const h = state.savedHandle;
+  state.busy = 'Scanning folder…'; render();
+  const items = await filesFromHandle(h, msg => { state.busy = msg; renderBusy(); });
+  await loadItems(items, h.name, true);
+}
+
+// Bring back the library remembered from the last scan without touching the files.
+async function restoreIndex() {
+  const saved = await idb.get('kv', 'index');
+  if (!saved?.entries?.length) return false;
+  state.raw = saved.entries.map((e, i) => ({ id: i, path: e.path, tags: e.tags }));
+  state.libraryName = saved.name;
+  rebuild();
+  state.round = null;
+  return true;
+}
+
+// `rescan` walks the folder again (picking up added or moved files) instead of using the saved index.
+async function reopenSaved(rescan = false) {
   const h = state.savedHandle;
   if (!h) return;
   try {
@@ -189,9 +236,12 @@ async function reopenSaved() {
       toast('Permission was not granted.');
       return;
     }
-    state.busy = 'Scanning folder…'; render();
-    const items = await filesFromHandle(h, msg => { state.busy = msg; renderBusy(); });
-    await loadItems(items, h.name);
+    if (!rescan && await restoreIndex()) {
+      state.tab = state.byOrch.size >= 2 ? 'quiz' : 'library';
+      render();
+      return;
+    }
+    await scanSaved();
   } catch (e) {
     toast(e.message); state.busy = ''; render();
   }
@@ -659,7 +709,7 @@ function renderLibrary() {
       </div>
       <div class="row">
         ${'showDirectoryPicker' in window ? '<button class="btn ghost sm" data-act="open-folder">Change folder</button>' : '<button class="btn ghost sm" data-act="pick-folder">Change folder</button>'}
-        ${state.savedHandle ? '<button class="btn ghost sm" data-act="reopen">Rescan</button>' : ''}
+        ${state.savedHandle ? '<button class="btn ghost sm" data-act="rescan">Rescan</button>' : ''}
         <button class="btn ghost sm" data-act="pick-files">Choose files</button>
       </div>
       <label class="check"><input type="checkbox" data-set="noSingerInstrumental" ${settings.noSingerInstrumental ? 'checked' : ''}> <span>Treat tracks with no singer found as <i>Instrumental</i>. Turn this on if your tags always name the singer when there is one.</span></label>
@@ -728,7 +778,8 @@ const actions = {
   'open-folder': openFolderPicker,
   'pick-folder': () => pickFiles(true),
   'pick-files': () => pickFiles(false),
-  reopen: reopenSaved,
+  reopen: () => reopenSaved(),
+  rescan: () => reopenSaved(true),
   start: () => { state.session = { n: 0, ok: 0, streak: 0 }; newRound(); },
   next: () => newRound(),
   quit: () => { stopAudio(); state.round = null; render(); },
@@ -850,6 +901,11 @@ document.addEventListener('keydown', e => {
 
 (async function init() {
   try { state.savedHandle = (await idb.get('kv', 'dir')) || null; } catch {}
+  // If the browser still remembers the folder permission, the library is ready without a tap.
+  try {
+    if (state.savedHandle && (await state.savedHandle.queryPermission({ mode: 'read' })) === 'granted') await restoreIndex();
+  } catch {}
+  initMediaControls();
   render();
   if ('serviceWorker' in navigator && location.protocol !== 'file:') {
     navigator.serviceWorker.register('sw.js').catch(() => {});
