@@ -485,5 +485,14 @@ export const ERAS = [
   { id: '60+', label: '1960 and later', from: 1960, to: 9999 },
 ];
 
-export const eraOf = year => (year ? ERAS.find(e => year >= e.from && year <= e.to) : null);
+// Unlock order for step-by-step mode: the four most distinct sounds first, then the other
+// dance-floor staples, then the rarer and later orchestras. Unlisted ids go at the end.
+export const CURRICULUM = [
+  'darienzo', 'disarli', 'troilo', 'pugliese',
+  'canaro', 'calo', 'biagi', 'fresedo', 'tanturi', 'dagostino', 'laurenz', 'demare',
+  'donato', 'rodriguez', 'deangelis', 'lomuto', 'firpo', 'decaro', 'otv', 'varela',
+  'malerba', 'federico', 'sassone', 'gobbi', 'francini',
+];
+
+export const eraOf =year => (year ? ERAS.find(e => year >= e.from && year <= e.to) : null);
 export const orchById = Object.fromEntries(ORCHESTRAS.map(o => [o.id, o]));

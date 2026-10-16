@@ -1,4 +1,4 @@
-import { ORCHESTRAS, ERAS, orchById } from './data.js';
+import { ORCHESTRAS, ERAS, CURRICULUM, orchById } from './data.js';
 import { describe, fileFromPath, filesFromHandle, filesFromInput, scan, norm } from './library.js';
 import { idb, load, save } from './store.js';
 
@@ -12,8 +12,17 @@ const settings = load('settings', {
   focusWeak: true,
   excluded: [],
   noSingerInstrumental: false,
+  steps: true,             // unlock orchestras gradually
+  contrast: true,          // after a wrong answer, play both orchestras back to back
 });
-const stats = load('stats', { orch: {}, conf: {}, era: { n: 0, ok: 0 }, singer: { n: 0, ok: 0 }, best: 0 });
+const STEP_START = 4, STEP_WINDOW = 20, STEP_NEED = 16, RECENT_LEN = 10, CONTRAST_LEN = 15;
+const freshStats = () => ({
+  orch: {}, conf: {}, era: { n: 0, ok: 0 }, singer: { n: 0, ok: 0 }, best: 0,
+  recent: {},         // per orchestra: last RECENT_LEN results (1/0)
+  level: STEP_START,  // step by step: how many orchestras are unlocked
+  window: [],         // step by step: results since the last unlock, capped at STEP_WINDOW
+});
+const stats = load('stats', freshStats());
 const mappings = load('mappings', {});
 
 const state = {
@@ -147,7 +156,7 @@ function initMediaControls() {
   on('previoustrack', replay);
   on('nexttrack', () => {
     if (!clip) return;
-    if (clip.owner === 'quiz' && state.round?.done) newRound();
+    if (state.round?.done && (clip.owner === 'quiz' || clip.owner.startsWith('contrast'))) newRound();
     else if (clip.owner === 'cmp-a' || clip.owner === 'cmp-b') comparePlay(clip.owner === 'cmp-a' ? 'b' : 'a');
     else actions['other-part']();
   });
@@ -265,6 +274,27 @@ function pickFiles(folder) {
 
 const eligibleOrchs = () => [...state.byOrch.keys()].filter(id => !settings.excluded.includes(id));
 
+const curriculumRank = id => { const i = CURRICULUM.indexOf(id); return i < 0 ? CURRICULUM.length : i; };
+const orderedOrchs = () => eligibleOrchs().sort((a, b) => curriculumRank(a) - curriculumRank(b) || orchById[a].name.localeCompare(orchById[b].name));
+
+// The orchestras the quiz draws from: everything eligible, or step by step the first few in curriculum order.
+function quizPool() {
+  const ids = orderedOrchs();
+  return settings.steps ? ids.slice(0, Math.max(2, stats.level)) : ids;
+}
+const nextUnlock = () => (settings.steps && orderedOrchs()[quizPool().length]) || null;
+
+const recentAcc = id => { const r = stats.recent[id] || []; return r.length ? r.reduce((a, b) => a + b, 0) / r.length : 0; };
+const windowOk = () => stats.window.reduce((a, b) => a + b, 0);
+
+function unlockNext() {
+  const id = nextUnlock();
+  if (!id) return null;
+  stats.level = quizPool().length + 1;
+  stats.window = [];
+  return id;
+}
+
 function orchWeight(id) {
   if (!settings.focusWeak) return 1;
   const s = stats.orch[id] || { n: 0, ok: 0 };
@@ -272,7 +302,7 @@ function orchWeight(id) {
 }
 
 function pickTrack(pool) {
-  const ids = pool || eligibleOrchs();
+  const ids = pool || quizPool();
   const weights = ids.map(orchWeight);
   let r = Math.random() * weights.reduce((a, b) => a + b, 0);
   let id = ids[ids.length - 1];
@@ -290,10 +320,13 @@ function confusionScore(a, b) {
 
 function orchestraChoices(correct) {
   const o = orchById[correct];
-  const pool = eligibleOrchs().filter(id => id !== correct);
+  const pool = quizPool().filter(id => id !== correct);
+  // Step by step, look-alike wrong answers only start once you reliably get this orchestra right.
+  const similar = settings.difficulty === 'similar' &&
+    (!settings.steps || ((stats.recent[correct] || []).length >= 5 && recentAcc(correct) >= 0.7));
   const scored = pool.map(id => {
     let s = Math.random();
-    if (settings.difficulty === 'similar') {
+    if (similar) {
       if (o.confusable.includes(id) || orchById[id].confusable.includes(correct)) s += 1.5;
       s += Math.min(2, confusionScore(correct, id) * 0.5);
     }
@@ -321,7 +354,7 @@ function singerChoices(track) {
 }
 
 async function newRound(attempt = 0) {
-  if (eligibleOrchs().length < 2) { toast('You need at least two orchestras in the quiz pool.'); return; }
+  if (quizPool().length < 2) { toast('You need at least two orchestras in the quiz pool.'); return; }
   const track = pickTrack();
   const steps = [{ type: 'orchestra', q: 'Which orchestra?', choices: orchestraChoices(track.orchestra), answer: track.orchestra }];
   if (settings.quizType === 'full') {
@@ -331,10 +364,11 @@ async function newRound(attempt = 0) {
       if (choices.length > 1) steps.push({ type: 'singer', q: 'Who is singing?', choices, answer: track.singer });
     }
   }
-  state.round = { track, steps, step: 0, done: false };
+  const round = state.round = { track, steps, step: 0, done: false, frac: null };
   render();
   try {
     await playClip(track, { owner: 'quiz' });
+    round.frac = clip.start / (audio.duration || 180);
   } catch (e) {
     console.warn(e);
     if (attempt < 3) return newRound(attempt + 1);
@@ -353,6 +387,17 @@ function answer(choice) {
     const o = (stats.orch[s.answer] ||= { n: 0, ok: 0 });
     o.n++; if (ok) o.ok++;
     if (!ok) { stats.conf[s.answer] ||= {}; stats.conf[s.answer][choice] = (stats.conf[s.answer][choice] || 0) + 1; }
+    const rec = (stats.recent[s.answer] ||= []);
+    rec.push(ok ? 1 : 0);
+    if (rec.length > RECENT_LEN) rec.shift();
+    if (settings.steps) {
+      stats.window.push(ok ? 1 : 0);
+      if (stats.window.length > STEP_WINDOW) stats.window.shift();
+      if (stats.window.length >= STEP_WINDOW && windowOk() >= STEP_NEED) {
+        r.unlocked = unlockNext();
+        if (r.unlocked) toast(`New orchestra unlocked: ${orchById[r.unlocked].name}`);
+      }
+    }
     state.session.n++;
     if (ok) { state.session.ok++; state.session.streak++; stats.best = Math.max(stats.best, state.session.streak); }
     else state.session.streak = 0;
@@ -363,7 +408,39 @@ function answer(choice) {
   saveAll();
   if (r.step < r.steps.length - 1) r.step++;
   else r.done = true;
+  const first = r.steps[0];
+  if (r.done && first.picked !== first.answer) {
+    r.contrast = contrastPair(r, first.picked);
+    render();
+    if (settings.contrast && r.contrast) playContrast('a', true);
+    return;
+  }
   render();
+}
+
+/* Hear the difference: after a wrong answer, the mystery track and a track by the orchestra
+   you guessed, from the same point, back to back. The same piece if both recorded it. */
+function contrastPair(r, wrongId) {
+  const tracks = state.byOrch.get(wrongId);
+  if (!tracks?.length) return null;
+  const t = r.track;
+  const same = tracks.filter(x => norm(x.title) === norm(t.title));
+  const sameEra = tracks.filter(x => t.era && x.era === t.era);
+  const b = pick(same.length ? same : sameEra.length ? sameEra : tracks);
+  return { a: t, b, wrongId, same: same.length > 0, frac: r.frac ?? 0.25 };
+}
+
+async function playContrast(key, chain = false) {
+  const r = state.round, c = r?.contrast;
+  if (!c) return;
+  const o = orchById[key === 'a' ? r.track.orchestra : c.wrongId];
+  try {
+    await playClip(c[key], {
+      owner: `contrast-${key}`, frac: c.frac, len: CONTRAST_LEN,
+      label: `${key === 'a' ? 'It was' : 'Your guess'}: ${o.name}`,
+      onEnd: chain && key === 'a' ? () => { if (state.round === r) playContrast('b'); } : null,
+    });
+  } catch (e) { toast(e.message); }
 }
 
 const choiceLabel = (type, id) =>
@@ -379,6 +456,7 @@ function renderQuiz() {
     <div class="scorebar">
       <span><b>${s.ok}</b>/${s.n} correct</span>
       <span>Streak <b>${s.streak}</b> · best ${stats.best}</span>
+      ${nextUnlock() ? `<span title="Correct answers in your last ${STEP_WINDOW}; ${STEP_NEED} unlocks ${esc(orchById[nextUnlock()].name)}">Unlock <b>${windowOk()}</b>/${STEP_NEED}</span>` : ''}
       <button class="link" data-act="quit">Settings</button>
     </div>
     ${playerCard('quiz', r.done ? `${esc(t.title)}` : 'Mystery track', r.done)}`;
@@ -412,6 +490,8 @@ function renderQuiz() {
             <div class="meta">${esc(t.title)}${t.singer ? ` · ${esc(t.singer)}` : ''}${t.year ? ` · ${t.year}` : ''}</div>
           </div>
         </div>
+        ${r.unlocked ? `<p class="tip"><b>New orchestra unlocked: ${esc(orchById[r.unlocked].name)}.</b> ${esc(orchById[r.unlocked].summary)}</p>` : ''}
+        ${r.contrast ? contrastCard(r) : ''}
         ${tip ? `<p class="tip"><b>${esc(o.name)} vs ${esc(orchById[wrongId].name)}:</b> ${esc(tip)}</p>` : ''}
         <ul class="listen">${o.listenFor.slice(0, 3).map(l => `<li>${esc(l)}</li>`).join('')}</ul>
         <div class="row">
@@ -423,6 +503,32 @@ function renderQuiz() {
       </section>`;
   }
   view.innerHTML = html;
+}
+
+function contrastCard(r) {
+  const c = r.contrast;
+  const side = (key, o, t, caption) => `
+    <div class="side" style="--accent:${o.color}">
+      <button class="play-big sm" data-act="contrast-play" data-k="${key}" data-playing="contrast-${key}" aria-label="Play ${esc(o.name)}">
+        <svg class="i-play" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+        <svg class="i-wave" viewBox="0 0 24 24"><path d="M4 10v4M8 6v12M12 3v18M16 7v10M20 10v4" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" fill="none"/></svg>
+      </button>
+      <div class="side-body">
+        <div class="side-name">${caption} · ${esc(o.name)}</div>
+        <div class="meta">${esc(t.title)}${t.singer ? ' · ' + esc(t.singer) : ''}${t.year ? ' · ' + t.year : ''}</div>
+        <div class="bar"><div class="bar-fill" data-clipbar="contrast-${key}"></div></div>
+      </div>
+    </div>`;
+  return `
+    <div class="contrast">
+      <div class="contrast-head">
+        <h3>Hear the difference</h3>
+        <button class="btn ghost sm" data-act="contrast-both">▶ Play both</button>
+      </div>
+      <p class="muted small">${c.same ? `Both orchestras recorded “${esc(c.a.title)}”: roughly the same passage from each.` : 'The same point in the mystery track and in a track by the orchestra you picked.'}</p>
+      ${side('a', orchById[r.track.orchestra], c.a, 'It was')}
+      ${side('b', orchById[c.wrongId], c.b, 'Your guess')}
+    </div>`;
 }
 
 function playerCard(owner, label, revealed) {
@@ -444,9 +550,26 @@ function playerCard(owner, label, revealed) {
     </section>`;
 }
 
+function stepsCard() {
+  const pool = quizPool(), next = nextUnlock();
+  return `
+    <section class="card">
+      <h3>Step by step <span class="muted small">${pool.length} of ${orderedOrchs().length} orchestras</span></h3>
+      <div class="chips">${pool.map(id => `<span class="chip"><i class="sw" style="background:${orchById[id].color}"></i>${esc(orchById[id].name)}</span>`).join('')}</div>
+      ${next ? `
+        <p class="small">Next up: <b>${esc(orchById[next].name)}</b>. Get ${STEP_NEED} of your last ${STEP_WINDOW} answers right to unlock it
+          <span class="muted">(so far ${windowOk()} of ${stats.window.length})</span>.</p>`
+        : '<p class="small">Every orchestra in your library is unlocked.</p>'}
+      <div class="row small">
+        ${pool.length > 2 ? '<button class="btn ghost sm" data-act="step-back">− One fewer</button>' : ''}
+        ${next ? '<button class="btn ghost sm" data-act="step-next">+ Unlock next now</button>' : ''}
+      </div>
+    </section>`;
+}
+
 function renderQuizSetup() {
   const orchs = [...state.byOrch.keys()].sort((a, b) => orchById[a].name.localeCompare(orchById[b].name));
-  const pool = eligibleOrchs();
+  const pool = quizPool();
   const opt = (key, val, label) => `<button class="seg ${settings[key] === val ? 'on' : ''}" data-act="set" data-k="${key}" data-v="${val}">${label}</button>`;
   view.innerHTML = `
     <section class="card hero">
@@ -456,20 +579,23 @@ function renderQuizSetup() {
       ${pool.length < 2 ? '<p class="warn">Need at least two orchestras in the pool.</p>' : ''}
     </section>
     <section class="card settings">
+      <div class="field"><label>Orchestras</label><div class="segs">${opt('steps', true, 'Step by step')}${opt('steps', false, 'All at once')}</div></div>
       <div class="field"><label>Mode</label><div class="segs">${opt('quizType', 'orchestra', 'Orchestra')}${opt('quizType', 'full', 'Full: + era + singer')}</div></div>
       <div class="field"><label>Wrong answers</label><div class="segs">${opt('difficulty', 'similar', 'Similar orchestras')}${opt('difficulty', 'random', 'Random')}</div></div>
       <div class="field"><label>Clip length</label><div class="segs">${[15, 30, 45, 60].map(v => opt('clipLen', v, v + 's')).join('')}</div></div>
       <div class="field"><label>Choices</label><div class="segs">${[3, 4, 6].map(v => opt('choices', v, v)).join('')}${opt('choices', 0, 'All')}</div></div>
       <label class="check"><input type="checkbox" data-set="focusWeak" ${settings.focusWeak ? 'checked' : ''}> Play more of the orchestras I get wrong</label>
+      <label class="check"><input type="checkbox" data-set="contrast" ${settings.contrast ? 'checked' : ''}> After a wrong answer, play both orchestras back to back</label>
       <details>
-        <summary>Orchestras in the pool (${pool.length}/${orchs.length})</summary>
+        <summary>Orchestras in your library (${eligibleOrchs().length}/${orchs.length} included)</summary>
         <div class="pool">${orchs.map(id => `
           <label class="check"><input type="checkbox" data-pool="${id}" ${settings.excluded.includes(id) ? '' : 'checked'}>
           <i class="sw" style="background:${orchById[id].color}"></i>${esc(orchById[id].name)} <span class="muted">${state.byOrch.get(id).length}</span></label>`).join('')}
         </div>
         <div class="row small"><button class="btn ghost sm" data-act="pool-all">All</button><button class="btn ghost sm" data-act="pool-none">None</button></div>
       </details>
-    </section>`;
+    </section>
+    ${settings.steps && pool.length ? stepsCard() : ''}`;
 }
 
 /* ================= Compare ================= */
@@ -784,19 +910,31 @@ const actions = {
   next: () => newRound(),
   quit: () => { stopAudio(); state.round = null; render(); },
   answer: el => answer(el.dataset.v),
-  replay: () => { if (clip) replay(); else if (state.round) newRound(); },
+  replay: async () => {
+    const r = state.round;
+    if (!r) return clip && replay();
+    if (clip?.owner === 'quiz') return replay();
+    // After a contrast clip, the quiz card's replay goes back to the mystery clip.
+    try { await playClip(r.track, { owner: 'quiz', frac: r.frac, label: r.done ? r.track.title : 'Mystery track' }); } catch (e) { toast(e.message); }
+  },
   stop: stopAudio,
   full: playFull,
   'other-part': async () => {
     if (!clip) return;
-    const owner = clip.owner;
-    try { await playClip(clip.track, { owner, label: state.round?.done ? state.round.track.title : 'Mystery track' }); } catch (e) { toast(e.message); }
+    // From a contrast clip, "other part" means the quiz track.
+    const quiz = state.round && clip.owner.startsWith('contrast');
+    const owner = quiz ? 'quiz' : clip.owner, track = quiz ? state.round.track : clip.track;
+    try { await playClip(track, { owner, label: state.round?.done ? state.round.track.title : 'Mystery track' }); } catch (e) { toast(e.message); }
   },
   set: el => {
     const k = el.dataset.k, v = el.dataset.v;
-    settings[k] = typeof settings[k] === 'number' ? +v : v;
+    settings[k] = typeof settings[k] === 'number' ? +v : typeof settings[k] === 'boolean' ? v === 'true' : v;
     saveAll(); render();
   },
+  'step-next': () => { unlockNext(); saveAll(); render(); },
+  'step-back': () => { stats.level = Math.max(2, quizPool().length - 1); stats.window = []; saveAll(); render(); },
+  'contrast-play': el => playContrast(el.dataset.k),
+  'contrast-both': () => playContrast('a', true),
   'pool-all': () => { settings.excluded = []; saveAll(); render(); },
   'pool-none': () => { settings.excluded = [...state.byOrch.keys()]; saveAll(); render(); },
   'compare-pair': el => {
@@ -833,7 +971,7 @@ const actions = {
   unmap: el => { delete mappings[el.dataset.k]; saveAll(); rebuild(); render(); },
   'reset-stats': () => {
     if (!confirm('Reset all quiz statistics?')) return;
-    Object.assign(stats, { orch: {}, conf: {}, era: { n: 0, ok: 0 }, singer: { n: 0, ok: 0 }, best: 0 });
+    Object.assign(stats, freshStats());
     saveAll(); render();
   },
 };

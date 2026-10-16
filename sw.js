@@ -1,5 +1,5 @@
 // Network-first service worker: always fresh when online, works offline from cache.
-const CACHE = 'tango-ear-v2';
+const CACHE = 'tango-ear-v3';
 const SHELL = [
   './', 'index.html', 'css/styles.css', 'manifest.webmanifest',
   'js/app.js', 'js/data.js', 'js/library.js', 'js/store.js', 'js/tags.js',
